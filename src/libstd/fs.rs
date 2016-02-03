@@ -1461,11 +1461,20 @@ impl DirBuilder {
     }
 
     fn create_dir_all(&self, path: &Path) -> io::Result<()> {
-        if path == Path::new("") || path.is_dir() { return Ok(()) }
-        if let Some(p) = path.parent() {
-            try!(self.create_dir_all(p))
+        use io::ErrorKind::{AlreadyExists, NotFound};
+        match self.inner.mkdir(path) {
+            Ok(()) => Ok(()),
+            Err(ref e) if e.kind() == NotFound => {
+                // recursively create parent dirs and try again
+                if let Some(parent) = path.parent() {
+                    try!(self.create_dir_all(parent))
+                };
+                self.inner.mkdir(path)
+            }
+            Err(ref e) if e.kind() == AlreadyExists && try!(path.metadata()).is_dir() =>
+                Ok(()), // we don't have to recurse any deeper
+            Err(e) => Err(e),
         }
-        self.inner.mkdir(path)
     }
 }
 
@@ -1829,6 +1838,25 @@ mod tests {
         let dir = tmpdir.join("d1/d2");
         check!(fs::create_dir_all(&dir));
         assert!(dir.is_dir())
+    }
+
+    #[test]
+    fn recursive_mkdir_dangling_symlink() {
+        let tmpdir = tmpdir();
+        let target = tmpdir.join("target");
+        let junction = tmpdir.join("junction");
+        let b = junction.join("a/b");
+
+        check!(symlink_junction(&target, &junction));
+        check!(fs::create_dir_all(&b));
+        assert!(b.exists());
+
+        // if !got_symlink_permission(&tmpdir) { return };
+        // let file_symlink = tmpdir.join("dangling_symlink");
+        // check!(symlink_dir(&target, &link));
+        // check!(fs::create_dir_all(&d));
+        // assert!(link.is_dir());
+        // assert!(d.exists());
     }
 
     #[test]
