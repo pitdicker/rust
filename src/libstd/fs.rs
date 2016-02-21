@@ -2121,6 +2121,14 @@ mod tests {
     }
 
     #[test]
+    fn rename_works() {
+        let tmp = tmpdir();
+        check!(File::create(tmp.join("old.txt")));
+        check!(fs::rename(tmp.join("old.txt"), tmp.join("new.txt")));
+        assert!(tmp.join("new.txt").exists());
+    }
+
+    #[test]
     fn symlinks_work() {
         let tmpdir = tmpdir();
         if !got_symlink_permission(&tmpdir) { return };

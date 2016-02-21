@@ -11,7 +11,7 @@
 use io::prelude::*;
 use os::windows::prelude::*;
 
-use ffi::OsString;
+use ffi::{OsString, OsStr};
 use fmt;
 use io::{self, Error, SeekFrom};
 use mem;
@@ -23,6 +23,7 @@ use sys::handle::Handle;
 use sys::time::SystemTime;
 use sys::{c, cvt};
 use sys_common::FromInner;
+use vec::Vec;
 
 use super::to_u16s;
 
@@ -78,7 +79,7 @@ pub struct OpenOptions {
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub struct FilePermissions { attrs: c::DWORD }
+pub struct FilePermissions { readonly: bool }
 
 pub struct DirBuilder;
 
@@ -333,6 +334,68 @@ impl File {
         Ok(newpos as u64)
     }
 
+    pub fn remove(&self) -> io::Result<()> {
+        let mut info = c::FILE_DISPOSITION_INFO {
+            DeleteFile: -1,
+        };
+        let size = mem::size_of_val(&info);
+        try!(cvt(unsafe {
+            c::SetFileInformationByHandle(self.handle.raw(),
+                                          c::FileDispositionInfo,
+                                          &mut info as *mut _ as *mut _,
+                                          size as c::DWORD)
+        }));
+        Ok(())
+    }
+
+    pub fn rename(&self, new: &Path, replace: bool) -> io::Result<()> {
+        // &self must be opened with DELETE permission
+
+        #[cfg(target_arch = "x86")]
+        const STRUCT_SIZE: usize = 12;
+        #[cfg(target_arch = "x86_64")]
+        const STRUCT_SIZE: usize = 20;
+
+        // FIXME: check for internal NULs in 'new'
+        let reserved = OsStr::new(&"\0\0\0\0\0\0\0\0\0\0"[..STRUCT_SIZE/2]);
+        let mut data: Vec<u16> = reserved.encode_wide()
+                                 .chain(new.as_os_str().encode_wide())
+                                 .collect();
+        data.push(0);
+        let size = data.len() * 2;
+
+        unsafe {
+            // Thanks to alignment guarantees on Windows this works (8 for 32-bit and 16 for 64-bit)
+            let mut info = data.as_mut_ptr() as *mut c::FILE_RENAME_INFO;
+            (*info).ReplaceIfExists = if replace { -1 } else { c::FALSE };
+            (*info).RootDirectory = ptr::null_mut();
+            (*info).FileNameLength = (size - STRUCT_SIZE) as c::DWORD;
+            try!(cvt(c::SetFileInformationByHandle(self.handle().raw(),
+                                                   c::FileRenameInfo,
+                                                   data.as_mut_ptr() as *mut _ as *mut _,
+                                                   size as c::DWORD)));
+            Ok(())
+        }
+    }
+
+    pub fn set_attributes(&self, attr: c::DWORD) -> io::Result<()> {
+        let mut info = c::FILE_BASIC_INFO {
+            CreationTime: 0, // do not change
+            LastAccessTime: 0, // do not change
+            LastWriteTime: 0, // do not change
+            ChangeTime: 0, // do not change
+            FileAttributes: attr, // TODO: what if normal?
+        };
+        let size = mem::size_of_val(&info);
+        try!(cvt(unsafe {
+            c::SetFileInformationByHandle(self.handle.raw(),
+                                          c::FileBasicInfo,
+                                          &mut info as *mut _ as *mut _,
+                                          size as c::DWORD)
+        }));
+        Ok(())
+    }
+
     pub fn duplicate(&self) -> io::Result<File> {
         Ok(File {
             handle: try!(self.handle.duplicate(0, true, c::DUPLICATE_SAME_ACCESS)),
@@ -422,7 +485,12 @@ impl FileAttr {
     }
 
     pub fn perm(&self) -> FilePermissions {
-        FilePermissions { attrs: self.attributes }
+        FilePermissions {
+            // Only files can be read-only. If the flag is set on a directory
+            // this means the directory its view is customized by Windows (with a Desktop.ini file)
+            readonly: self.attributes & c::FILE_ATTRIBUTE_READONLY != 0 &&
+                      self.attributes & c::FILE_ATTRIBUTE_DIRECTORY == 0
+        }
     }
 
     pub fn attrs(&self) -> u32 { self.attributes as u32 }
@@ -465,17 +533,8 @@ fn to_u64(ft: &c::FILETIME) -> u64 {
 }
 
 impl FilePermissions {
-    pub fn readonly(&self) -> bool {
-        self.attrs & c::FILE_ATTRIBUTE_READONLY != 0
-    }
-
-    pub fn set_readonly(&mut self, readonly: bool) {
-        if readonly {
-            self.attrs |= c::FILE_ATTRIBUTE_READONLY;
-        } else {
-            self.attrs &= !c::FILE_ATTRIBUTE_READONLY;
-        }
-    }
+    pub fn readonly(&self) -> bool { self.readonly }
+    pub fn set_readonly(&mut self, readonly: bool) { self.readonly = readonly }
 }
 
 impl FileType {
@@ -501,9 +560,6 @@ impl FileType {
         *self == FileType::SymlinkFile ||
         *self == FileType::SymlinkDir ||
         *self == FileType::MountPoint
-    }
-    pub fn is_symlink_dir(&self) -> bool {
-        *self == FileType::SymlinkDir || *self == FileType::MountPoint
     }
 }
 
@@ -546,12 +602,12 @@ pub fn unlink(p: &Path) -> io::Result<()> {
 }
 
 pub fn rename(old: &Path, new: &Path) -> io::Result<()> {
-    let old = try!(to_u16s(old));
-    let new = try!(to_u16s(new));
-    try!(cvt(unsafe {
-        c::MoveFileExW(old.as_ptr(), new.as_ptr(), c::MOVEFILE_REPLACE_EXISTING)
-    }));
-    Ok(())
+    let mut opts = OpenOptions::new();
+    opts.access_mode(c::DELETE);
+    // This flag is so we can open directories too
+    opts.custom_flags(c::FILE_FLAG_BACKUP_SEMANTICS);
+    let file = try!(File::open(old, &opts));
+    file.rename(new, true)
 }
 
 pub fn rmdir(p: &Path) -> io::Result<()> {
@@ -567,23 +623,57 @@ pub fn remove_dir_all(path: &Path) -> io::Result<()> {
         // rmdir only deletes dir symlinks and junctions, not file symlinks.
         rmdir(path)
     } else {
-        remove_dir_all_recursive(path)
+        let path = try!(path.canonicalize());
+        let base_dir = path.parent().unwrap(); // TODO: just fail if there is no parent dir. if this fails we are trying to delete a drive letter (i think)
+        try!(remove_dir_all_recursive(path.as_ref(), base_dir.as_ref(), 0));
+        Ok(())
     }
 }
 
-fn remove_dir_all_recursive(path: &Path) -> io::Result<()> {
+fn remove_dir_all_recursive(path: &Path, base_dir: &Path, mut counter: u64) -> io::Result<u64> {
+    fn remove_item(path: &Path, base_dir: &Path, mut counter: u64, readonly: bool) -> io::Result<u64> {
+        // TODO: do not overwrite, but retry
+
+        let tmpname = base_dir.join(format!{"rm-{}", counter});
+        counter += 1;
+        let mut opts = OpenOptions::new();
+
+        if !readonly {
+            opts.access_mode(c::DELETE);
+            opts.custom_flags(c::FILE_FLAG_BACKUP_SEMANTICS | // delete directory
+                              c::FILE_FLAG_OPEN_REPARSE_POINT | // delete symlink
+                              c::FILE_FLAG_DELETE_ON_CLOSE);
+            let file = try!(File::open(path, &opts));
+            try!(file.rename(tmpname.as_ref(), true)); // TODO
+        } else {
+            opts.access_mode(c::DELETE | c::FILE_WRITE_ATTRIBUTES);
+            opts.custom_flags(c::FILE_FLAG_OPEN_REPARSE_POINT);
+            let file = try!(File::open(path, &opts));
+            let attr = try!(file.file_attr()).attributes;
+            try!(file.set_attributes(attr & !c::FILE_ATTRIBUTE_READONLY));
+            try!(file.rename(tmpname.as_ref(), true)); // TODO
+            try!(file.remove());
+            // restore read-only flag just in case there are other hard links
+            try!(file.set_attributes(attr | c::FILE_ATTRIBUTE_READONLY));
+        };
+        Ok(counter)
+    }
+
     for child in try!(readdir(path)) {
         let child = try!(child);
         let child_type = try!(child.file_type());
         if child_type.is_dir() {
-            try!(remove_dir_all_recursive(&child.path()));
-        } else if child_type.is_symlink_dir() {
-            try!(rmdir(&child.path()));
+            counter = try!(remove_dir_all_recursive(&child.path(), base_dir, counter));
         } else {
-            try!(unlink(&child.path()));
+            counter = try!(remove_item(&child.path().as_ref(),
+                                       base_dir,
+                                       counter,
+                                       try!(child.metadata()).perm().readonly()));
         }
     }
-    rmdir(path)
+
+    counter = try!(remove_item(path, base_dir, counter, false));
+    Ok(counter)
 }
 
 pub fn readlink(path: &Path) -> io::Result<PathBuf> {
@@ -640,12 +730,24 @@ pub fn lstat(path: &Path) -> io::Result<FileAttr> {
     file.file_attr()
 }
 
-pub fn set_perm(p: &Path, perm: FilePermissions) -> io::Result<()> {
-    let p = try!(to_u16s(p));
-    unsafe {
-        try!(cvt(c::SetFileAttributesW(p.as_ptr(), perm.attrs)));
-        Ok(())
+pub fn set_perm(path: &Path, perm: FilePermissions) -> io::Result<()> {
+    let mut opts = OpenOptions::new();
+    opts.access_mode(c::FILE_READ_ATTRIBUTES | c::FILE_WRITE_ATTRIBUTES);
+    opts.custom_flags(c::FILE_FLAG_BACKUP_SEMANTICS);
+    let file = try!(File::open(path, &opts));
+    let attr = try!(file.file_attr());
+    let mut file_attr = attr.attributes;
+
+    if perm.readonly {
+        if file_attr & c::FILE_ATTRIBUTE_DIRECTORY != 0 {
+            // TODO: return some kind of error
+        } else {
+            file_attr |= c::FILE_ATTRIBUTE_READONLY;
+        }
+    } else {
+        file_attr = file_attr & !c::FILE_ATTRIBUTE_READONLY;
     }
+    file.set_attributes(file_attr)
 }
 
 fn get_path(f: &File) -> io::Result<PathBuf> {

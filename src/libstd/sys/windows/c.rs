@@ -103,7 +103,7 @@ pub const FILE_EXECUTE: DWORD = 0x00000020;
 pub const FILE_READ_ATTRIBUTES: DWORD = 0x00000080;
 pub const FILE_WRITE_ATTRIBUTES: DWORD = 0x00000100;
 
-pub const DELETE: DWORD = 0x00008000;
+pub const DELETE: DWORD = 0x00010000;
 pub const READ_CONTROL: DWORD = 0x00020000;
 pub const WRITE_DAC: DWORD = 0x00040000;
 pub const WRITE_OWNER: DWORD = 0x00080000;
@@ -236,6 +236,7 @@ pub const MAX_PROTOCOL_CHAIN: DWORD = 7;
 pub const TOKEN_READ: DWORD = 0x20008;
 pub const FILE_FLAG_OPEN_REPARSE_POINT: DWORD = 0x00200000;
 pub const FILE_FLAG_BACKUP_SEMANTICS: DWORD = 0x02000000;
+pub const FILE_FLAG_DELETE_ON_CLOSE: DWORD = 0x04000000;
 pub const MAXIMUM_REPARSE_DATA_BUFFER_SIZE: usize = 16 * 1024;
 pub const FSCTL_GET_REPARSE_POINT: DWORD = 0x900a8;
 pub const IO_REPARSE_TAG_SYMLINK: DWORD = 0xa000000c;
@@ -509,6 +510,28 @@ pub enum FILE_INFO_BY_HANDLE_CLASS {
     FileIdExtdDirectoryInfo         = 19, // 0x13
     FileIdExtdDirectoryRestartInfo  = 20, // 0x14
     MaximumFileInfoByHandlesClass
+}
+
+#[repr(C)]
+pub struct FILE_BASIC_INFO {
+    pub CreationTime: LARGE_INTEGER,
+    pub LastAccessTime: LARGE_INTEGER,
+    pub LastWriteTime: LARGE_INTEGER,
+    pub ChangeTime: LARGE_INTEGER,
+    pub FileAttributes: DWORD,
+}
+
+#[repr(C)]
+pub struct FILE_RENAME_INFO {
+    pub ReplaceIfExists: BOOL, // for true use -1, not TRUE
+    pub RootDirectory: HANDLE, // NULL, or obtained with NtOpenDirectoryObject
+    pub FileNameLength: DWORD,
+    pub FileName: [WCHAR; 0],
+}
+
+#[repr(C)]
+pub struct FILE_DISPOSITION_INFO {
+    pub DeleteFile: BOOL, // for true use -1, not TRUE
 }
 
 #[repr(C)]
