@@ -82,31 +82,6 @@ impl Write for StderrRaw {
     fn flush(&mut self) -> io::Result<()> { self.0.flush() }
 }
 
-struct Maybe<T> (T);
-
-impl<W: io::Write> io::Write for Maybe<W> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        handle_ebadf(self.0.write(buf), buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        handle_ebadf(self.0.flush(), ())
-    }
-}
-
-impl<R: io::Read> io::Read for Maybe<R> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        handle_ebadf(self.0.read(buf), 0)
-    }
-}
-
-fn handle_ebadf<T>(r: io::Result<T>, default: T) -> io::Result<T> {
-    match r {
-        Err(ref e) if stdio::is_ebadf(e) => Ok(default),
-        r => r
-    }
-}
-
 /// A handle to the standard input stream of a process.
 ///
 /// Each handle is a shared reference to a global buffer of input data to this
@@ -128,7 +103,7 @@ fn handle_ebadf<T>(r: io::Result<T>, default: T) -> io::Result<T> {
 /// an error.
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct Stdin {
-    inner: &'static Mutex<BufReader<Maybe<StdinRaw>>>,
+    inner: &'static Mutex<BufReader<StdinRaw>>,
 }
 
 /// A locked reference to the `Stdin` handle.
@@ -146,7 +121,7 @@ pub struct Stdin {
 /// an error.
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct StdinLock<'a> {
-    inner: MutexGuard<'a, BufReader<Maybe<StdinRaw>>>,
+    inner: MutexGuard<'a, BufReader<StdinRaw>>,
 }
 
 /// Constructs a new handle to the standard input of the current process.
@@ -192,9 +167,9 @@ pub struct StdinLock<'a> {
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
 pub fn stdin() -> Stdin {
-    static STDIN: Lazy<Mutex<BufReader<Maybe<StdinRaw>>>> = Lazy::new();
-    fn stdin_init() -> Mutex<BufReader<Maybe<StdinRaw>>> {
-        Mutex::new(BufReader::with_capacity(stdio::STDIN_BUF_SIZE, Maybe(stdin_raw())))
+    static STDIN: Lazy<Mutex<BufReader<StdinRaw>>> = Lazy::new();
+    fn stdin_init() -> Mutex<BufReader<StdinRaw>> {
+        Mutex::new(BufReader::with_capacity(stdio::STDIN_BUF_SIZE, stdin_raw()))
     }
 
     Stdin {
@@ -339,7 +314,7 @@ pub struct Stdout {
     // FIXME: this should be LineWriter or BufWriter depending on the state of
     //        stdout (tty or not). Note that if this is not line buffered it
     //        should also flush-on-panic or some form of flush-on-abort.
-    inner: &'static ReentrantMutex<RefCell<LineWriter<Maybe<StdoutRaw>>>>,
+    inner: &'static ReentrantMutex<RefCell<LineWriter<StdoutRaw>>>,
 }
 
 /// A locked reference to the `Stdout` handle.
@@ -356,7 +331,7 @@ pub struct Stdout {
 /// [`Stdout::lock`]: struct.Stdout.html#method.lock
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct StdoutLock<'a> {
-    inner: ReentrantMutexGuard<'a, RefCell<LineWriter<Maybe<StdoutRaw>>>>,
+    inner: ReentrantMutexGuard<'a, RefCell<LineWriter<StdoutRaw>>>,
 }
 
 /// Constructs a new handle to the standard output of the current process.
@@ -402,9 +377,9 @@ pub struct StdoutLock<'a> {
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
 pub fn stdout() -> Stdout {
-    static STDOUT: Lazy<ReentrantMutex<RefCell<LineWriter<Maybe<StdoutRaw>>>>> = Lazy::new();
-    fn stdout_init() -> ReentrantMutex<RefCell<LineWriter<Maybe<StdoutRaw>>>> {
-        ReentrantMutex::new(RefCell::new(LineWriter::new(Maybe(stdout_raw()))))
+    static STDOUT: Lazy<ReentrantMutex<RefCell<LineWriter<StdoutRaw>>>> = Lazy::new();
+    fn stdout_init() -> ReentrantMutex<RefCell<LineWriter<StdoutRaw>>> {
+        ReentrantMutex::new(RefCell::new(LineWriter::new(stdout_raw())))
     }
 
     Stdout {
@@ -492,7 +467,7 @@ impl fmt::Debug for StdoutLock<'_> {
 /// an error.
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct Stderr {
-    inner: &'static ReentrantMutex<RefCell<Maybe<StderrRaw>>>,
+    inner: &'static ReentrantMutex<RefCell<StderrRaw>>,
 }
 
 /// A locked reference to the `Stderr` handle.
@@ -508,7 +483,7 @@ pub struct Stderr {
 /// an error.
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct StderrLock<'a> {
-    inner: ReentrantMutexGuard<'a, RefCell<Maybe<StderrRaw>>>,
+    inner: ReentrantMutexGuard<'a, RefCell<StderrRaw>>,
 }
 
 /// Constructs a new handle to the standard error of the current process.
@@ -550,9 +525,9 @@ pub struct StderrLock<'a> {
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
 pub fn stderr() -> Stderr {
-    static STDERR: Lazy<ReentrantMutex<RefCell<Maybe<StderrRaw>>>> = Lazy::new();
-    fn stderr_init() -> ReentrantMutex<RefCell<Maybe<StderrRaw>>> {
-        ReentrantMutex::new(RefCell::new(Maybe(stderr_raw())))
+    static STDERR: Lazy<ReentrantMutex<RefCell<StderrRaw>>> = Lazy::new();
+    fn stderr_init() -> ReentrantMutex<RefCell<StderrRaw>> {
+        ReentrantMutex::new(RefCell::new(stderr_raw()))
     }
 
     Stderr {

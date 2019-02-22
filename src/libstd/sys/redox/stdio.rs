@@ -53,10 +53,6 @@ impl io::Write for Stderr {
     }
 }
 
-pub fn is_ebadf(err: &io::Error) -> bool {
-    err.raw_os_error() == Some(::sys::syscall::EBADF as i32)
-}
-
 pub const STDIN_BUF_SIZE: usize = ::sys_common::io::DEFAULT_BUF_SIZE;
 
 pub fn panic_output() -> Option<impl io::Write> {
