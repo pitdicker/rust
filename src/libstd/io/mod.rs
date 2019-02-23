@@ -295,6 +295,9 @@ mod lazy;
 mod util;
 mod stdio;
 
+// Used by the sys::stdio types.
+pub(crate) use self::stdio::StdioMode;
+
 const DEFAULT_BUF_SIZE: usize = ::sys_common::io::DEFAULT_BUF_SIZE;
 
 struct Guard<'a> { buf: &'a mut Vec<u8>, len: usize }

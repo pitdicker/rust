@@ -82,6 +82,22 @@ impl Write for StderrRaw {
     fn flush(&mut self) -> io::Result<()> { self.0.flush() }
 }
 
+/// FIXME: add description
+#[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[allow(unused)]
+pub(crate) enum StdioMode {
+    /// Connected to a terminal on Unix-like systems, or Console on Windows.
+    Terminal,
+    /// Connected to a pipe or redirected to a file.
+    Pipe,
+    /// Windows-specific: connected to a terminal but not Windows Console.
+    PipedTerminal,
+    /// Not connected.
+    None,
+    /// Not yet determined / unknown
+    Unknown,
+}
+
 /// A handle to the standard input stream of a process.
 ///
 /// Each handle is a shared reference to a global buffer of input data to this

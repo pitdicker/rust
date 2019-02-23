@@ -19,6 +19,7 @@ use sys::handle::Handle;
 use sys::pipe::{self, AnonPipe};
 use sys::stdio;
 use sys::cvt;
+use sys::windows::ext::io::AsRawHandle;
 use sys_common::{AsInner, FromInner, IntoInner};
 use sys_common::process::{CommandEnv, EnvKey};
 use borrow::Borrow;
@@ -252,19 +253,16 @@ impl Stdio {
             // should still be unavailable so propagate the
             // INVALID_HANDLE_VALUE.
             Stdio::Inherit => {
-                if let Ok(res) = stdio::get_handle(stdio_id) {
-                    match res {
-                        Some(io) => {
-                            let io = Handle::new(io);
-                            let ret = io.duplicate(0, true,
-                                                   c::DUPLICATE_SAME_ACCESS);
-                            io.into_raw();
-                            return ret
-                        },
-                        None => return Ok(Handle::new(ptr::null_mut())),
+                match stdio::get_handle_and_mode(stdio_id) {
+                    Ok((io, _)) => {
+                        let io = Handle::new((*io).as_raw_handle());
+                        let ret = io.duplicate(0, true,
+                                               c::DUPLICATE_SAME_ACCESS);
+                        io.into_raw();
+                        return ret
                     }
+                    Err(..) => Ok(Handle::new(c::INVALID_HANDLE_VALUE)),
                 }
-                Ok(Handle::new(c::INVALID_HANDLE_VALUE))
             }
 
             Stdio::MakePipe => {

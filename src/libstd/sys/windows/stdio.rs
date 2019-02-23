@@ -2,20 +2,15 @@
 
 use char::decode_utf16;
 use cmp;
+use fs::File;
 use io;
+use io::StdioMode;
+use mem::ManuallyDrop;
 use ptr;
 use str;
 use sys::c;
 use sys::cvt;
-use sys::handle::Handle;
-
-// Don't cache handles but get them fresh for every read/write. This allows us to track changes to
-// the value over time (such as if a process calls `SetStdHandle` while it's running). See #40490.
-pub struct Stdin {
-    surrogate: u16,
-}
-pub struct Stdout;
-pub struct Stderr;
+use sys::windows::ext::io::{FromRawHandle, AsRawHandle};
 
 // Apparently Windows doesn't handle large reads on stdin or writes to stdout/stderr well (see
 // #13304 for details).
@@ -31,14 +26,140 @@ const MAX_BUFFER_SIZE: usize = 8192;
 // UTF-16 to UTF-8.
 pub const STDIN_BUF_SIZE: usize = MAX_BUFFER_SIZE / 2 * 3;
 
-pub fn get_handle(handle_id: c::DWORD) -> io::Result<Option<c::HANDLE>> {
-    let handle = unsafe { c::GetStdHandle(handle_id) };
-    if handle == c::INVALID_HANDLE_VALUE {
-        Err(io::Error::last_os_error())
-    } else if handle.is_null() {
-        Ok(None)
-    } else {
-        Ok(Some(handle))
+// Don't cache handles but get them fresh for every read/write. This allows us to track changes to
+// the value over time (such as if a process calls `SetStdHandle` while it's running). See #40490.
+pub struct Stdin {
+    surrogate: u16,
+    mode: StdioMode,
+    handle: ManuallyDrop<File>,
+}
+
+impl Stdin {
+    pub fn new() -> Stdin {
+        Stdin {
+            surrogate: 0,
+            mode: StdioMode::Unknown,
+            handle: ManuallyDrop::new(unsafe { File::from_raw_handle(ptr::null_mut()) }),
+        }
+    }
+
+    pub (crate) fn get_mode(&mut self) -> io::Result<StdioMode> {
+        let (handle, mode) = get_handle_and_mode(c::STD_INPUT_HANDLE)?;
+        self.handle = handle;
+        self.mode = mode;
+        Ok(self.mode)
+    }
+}
+
+impl io::Read for Stdin {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let handle = match self.mode {
+            StdioMode::Terminal => (*self.handle).as_raw_handle(),
+            StdioMode::Pipe |
+            StdioMode::PipedTerminal => return (*self.handle).read(buf),
+            StdioMode::None => return Ok(buf.len()),
+            StdioMode::Unknown => {
+                self.get_mode()?;
+                return self.read(buf)
+            }
+        };
+
+        if buf.len() == 0 {
+            return Ok(0);
+        } else if buf.len() < 4 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput,
+                        "Windows stdin in console mode does not support a buffer too small to \
+                        guarantee holding one arbitrary UTF-8 character (4 bytes)"))
+        }
+
+        let mut utf16_buf = [0u16; MAX_BUFFER_SIZE / 2];
+        // In the worst case, an UTF-8 string can take 3 bytes for every `u16` of an UTF-16. So
+        // we can read at most a third of `buf.len()` chars and uphold the guarantee no data gets
+        // lost.
+        let amount = cmp::min(buf.len() / 3, utf16_buf.len());
+        let read = read_u16s_fixup_surrogates(handle, &mut utf16_buf, amount, &mut self.surrogate)?;
+
+        utf16_to_utf8(&utf16_buf[..read], buf)
+    }
+}
+
+pub struct Stdout {
+    mode: StdioMode,
+    handle: ManuallyDrop<File>,
+}
+
+impl Stdout {
+    pub fn new() -> Stdout {
+        Stdout {
+            mode: StdioMode::Unknown,
+            handle: ManuallyDrop::new(unsafe { File::from_raw_handle(ptr::null_mut()) }),
+        }
+    }
+
+    pub (crate) fn get_mode(&mut self) -> io::Result<StdioMode> {
+        let (handle, mode) = get_handle_and_mode(c::STD_OUTPUT_HANDLE)?;
+        self.handle = handle;
+        self.mode = mode;
+        Ok(self.mode)
+    }
+}
+
+impl io::Write for Stdout {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self.mode {
+            StdioMode::Terminal => write_console((*self.handle).as_raw_handle(), buf),
+            StdioMode::Pipe |
+            StdioMode::PipedTerminal => (*self.handle).write(buf),
+            StdioMode::None => Ok(buf.len()),
+            StdioMode::Unknown => {
+                self.get_mode()?;
+                self.write(buf)
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+pub struct Stderr {
+    mode: StdioMode,
+    handle: ManuallyDrop<File>,
+}
+
+impl Stderr {
+    pub fn new() -> Stderr {
+        Stderr {
+            mode: StdioMode::Unknown,
+            handle: ManuallyDrop::new(unsafe { File::from_raw_handle(ptr::null_mut()) }),
+        }
+    }
+
+    pub (crate) fn get_mode(&mut self) -> io::Result<StdioMode> {
+        let (handle, mode) = get_handle_and_mode(c::STD_ERROR_HANDLE)?;
+        self.handle = handle;
+        self.mode = mode;
+        Ok(self.mode)
+    }
+}
+
+impl io::Write for Stderr {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self.mode {
+            StdioMode::Terminal => write_console((*self.handle).as_raw_handle(), buf),
+            StdioMode::Pipe |
+            StdioMode::PipedTerminal => (*self.handle).write(buf),
+            StdioMode::None => Ok(buf.len()),
+            StdioMode::Unknown => {
+                self.get_mode()?;
+                self.write(buf)
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -50,23 +171,26 @@ fn is_console(handle: c::HANDLE) -> bool {
     unsafe { c::GetConsoleMode(handle, &mut mode) != 0 }
 }
 
-fn write(handle_id: c::DWORD, data: &[u8]) -> io::Result<usize> {
-    let handle = match get_handle(handle_id)? {
-        Some(handle) => handle,
-        None => {
-            // No pipe or console connected. This case is common for GUI applications on Windows.
-            // To aid cross-platform compatability we act as if there is a console by consuming the
-            // buffer instead of returning an error. See RFC #1014.
-            return Ok(data.len());
-        },
-    };
-    if !is_console(handle) {
-        let handle = Handle::new(handle);
-        let ret = handle.write(data);
-        handle.into_raw(); // Don't close the handle
-        return ret;
+pub (crate) fn get_handle_and_mode(handle_id: c::DWORD)
+    -> io::Result<(ManuallyDrop<File>, StdioMode)>
+{
+    unsafe {
+        let handle = c::GetStdHandle(handle_id);
+        if handle == c::INVALID_HANDLE_VALUE {
+            Err(io::Error::last_os_error())
+        } else if handle.is_null() {
+            Ok((ManuallyDrop::new(File::from_raw_handle(ptr::null_mut())), StdioMode::None))
+        } else {
+            match is_console(handle) {
+                true => Ok((ManuallyDrop::new(File::from_raw_handle(handle)), StdioMode::Terminal)),
+                false => Ok((ManuallyDrop::new(File::from_raw_handle(handle)), StdioMode::Pipe)),
+                // FIXME: detect MSYS etc.
+            }
+        }
     }
+}
 
+fn write_console(handle: c::HANDLE, data: &[u8]) -> io::Result<usize> {
     // As the console is meant for presenting text, we assume bytes of `data` come from a string
     // and are encoded as UTF-8, which needs to be encoded as UTF-16.
     //
@@ -131,49 +255,6 @@ fn write_u16s(handle: c::HANDLE, data: &[u16]) -> io::Result<usize> {
                          ptr::null_mut())
     })?;
     Ok(written as usize)
-}
-
-impl Stdin {
-    pub fn new() -> Stdin {
-        Stdin { surrogate: 0 }
-    }
-}
-
-impl io::Read for Stdin {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let handle = match get_handle(c::STD_INPUT_HANDLE)? {
-            Some(handle) => handle,
-            None => {
-                // No pipe or console connected. This case is common for GUI applications on
-                // Windows. To aid cross-platform compatability we act as if there is an empty pipe
-                // by returning 0 bytes instead an error. See RFC #1014.
-                return Ok(0);
-            },
-        };
-        if !is_console(handle) {
-            let handle = Handle::new(handle);
-            let ret = handle.read(buf);
-            handle.into_raw(); // Don't close the handle
-            return ret;
-        }
-
-        if buf.len() == 0 {
-            return Ok(0);
-        } else if buf.len() < 4 {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput,
-                        "Windows stdin in console mode does not support a buffer too small to \
-                        guarantee holding one arbitrary UTF-8 character (4 bytes)"))
-        }
-
-        let mut utf16_buf = [0u16; MAX_BUFFER_SIZE / 2];
-        // In the worst case, an UTF-8 string can take 3 bytes for every `u16` of an UTF-16. So
-        // we can read at most a third of `buf.len()` chars and uphold the guarantee no data gets
-        // lost.
-        let amount = cmp::min(buf.len() / 3, utf16_buf.len());
-        let read = read_u16s_fixup_surrogates(handle, &mut utf16_buf, amount, &mut self.surrogate)?;
-
-        utf16_to_utf8(&utf16_buf[..read], buf)
-    }
 }
 
 // We assume that if the last `u16` is an unpaired surrogate they got sliced apart by our
@@ -255,34 +336,6 @@ fn utf16_to_utf8(utf16: &[u16], utf8: &mut [u8]) -> io::Result<usize> {
         }
     }
     Ok(written)
-}
-
-impl Stdout {
-    pub fn new() -> Stdout { Stdout }
-}
-
-impl io::Write for Stdout {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        write(c::STD_OUTPUT_HANDLE, buf)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-impl Stderr {
-    pub fn new() -> Stderr { Stderr }
-}
-
-impl io::Write for Stderr {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        write(c::STD_ERROR_HANDLE, buf)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
 }
 
 pub fn panic_output() -> Option<impl io::Write> {
