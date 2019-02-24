@@ -888,6 +888,23 @@ impl<W: Write> LineWriter<W> {
             }, e)
         })
     }
+
+    /// Consumes the `LineWriter`, turning it into a `BufWriter`.
+    ///
+    /// Used inside the standard library for `Stdout`.
+    pub (crate) fn into_bufwriter(self) -> BufWriter<W> {
+        self.inner
+    }
+
+    /// Consumes the `BufWriter`, turning it into a `LineWriter`.
+    ///
+    /// Used inside the standard library for `Stdout`.
+    pub (crate) fn from_bufwriter(bufwriter: BufWriter<W>) -> LineWriter<W> {
+        LineWriter {
+            inner: bufwriter,
+            need_flush: false,
+        }
+    }
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]

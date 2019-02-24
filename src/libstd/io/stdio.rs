@@ -3,11 +3,12 @@ use io::prelude::*;
 use cell::RefCell;
 use fmt;
 use io::lazy::Lazy;
-use io::{self, Initializer, BufReader, LineWriter};
+use io::{self, Initializer, BufReader, BufWriter, LineWriter};
 use sync::{Mutex, MutexGuard};
 use sys::stdio;
 use sys_common::remutex::{ReentrantMutex, ReentrantMutexGuard};
 use thread::LocalKey;
+use mem;
 
 /// Stdout used by print! and println! macros
 thread_local! {
@@ -82,6 +83,93 @@ impl Write for StderrRaw {
     fn flush(&mut self) -> io::Result<()> { self.0.flush() }
 }
 
+impl StdinRaw {
+    fn get_mode(&mut self) -> io::Result<StdioMode> { self.0.get_mode() }
+}
+
+impl StdoutRaw {
+    fn get_mode(&mut self) -> io::Result<StdioMode> { self.0.get_mode() }
+}
+
+impl StderrRaw {
+    fn get_mode(&mut self) -> io::Result<StdioMode> { self.0.get_mode() }
+}
+
+/// FIXME: documentation
+struct StdinMaybe {
+    inner: StdinRaw,
+    fake: bool,
+}
+
+impl StdinMaybe {
+    fn new(stdin: StdinRaw) -> StdinMaybe {
+        StdinMaybe {
+            inner: stdin,
+            fake: false,
+        }
+    }
+
+    fn check_exists(&mut self) {
+        self.fake = match self.inner.get_mode() {
+            Ok(mode) => match mode {
+                StdioMode::None => true,
+                _ => false,
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+impl io::Read for StdinMaybe {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self.fake {
+            false => self.inner.read(buf),
+            true => Ok(buf.len()),
+        }
+    }
+}
+
+/// FIXME: documentation
+struct StderrMaybe {
+    inner: StderrRaw,
+    fake: bool,
+}
+
+impl StderrMaybe {
+    fn new(stderr: StderrRaw) -> StderrMaybe {
+        StderrMaybe {
+            inner: stderr,
+            fake: false,
+        }
+    }
+
+    fn check_exists(&mut self) {
+        self.fake = match self.inner.get_mode() {
+            Ok(mode) => match mode {
+                StdioMode::None => true,
+                _ => false,
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+impl io::Write for StderrMaybe {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self.fake {
+            false => self.inner.write(buf),
+            true => Ok(buf.len()),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self.fake {
+            false => self.inner.flush(),
+            true => Ok(()),
+        }
+    }
+}
+
 /// FIXME: add description
 #[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[allow(unused)]
@@ -94,8 +182,6 @@ pub(crate) enum StdioMode {
     PipedTerminal,
     /// Not connected.
     None,
-    /// Not yet determined / unknown
-    Unknown,
 }
 
 /// A handle to the standard input stream of a process.
@@ -119,7 +205,7 @@ pub(crate) enum StdioMode {
 /// an error.
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct Stdin {
-    inner: &'static Mutex<BufReader<StdinRaw>>,
+    inner: &'static Mutex<BufReader<StdinMaybe>>,
 }
 
 /// A locked reference to the `Stdin` handle.
@@ -137,7 +223,7 @@ pub struct Stdin {
 /// an error.
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct StdinLock<'a> {
-    inner: MutexGuard<'a, BufReader<StdinRaw>>,
+    inner: MutexGuard<'a, BufReader<StdinMaybe>>,
 }
 
 /// Constructs a new handle to the standard input of the current process.
@@ -183,9 +269,9 @@ pub struct StdinLock<'a> {
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
 pub fn stdin() -> Stdin {
-    static STDIN: Lazy<Mutex<BufReader<StdinRaw>>> = Lazy::new();
-    fn stdin_init() -> Mutex<BufReader<StdinRaw>> {
-        Mutex::new(BufReader::with_capacity(stdio::STDIN_BUF_SIZE, stdin_raw()))
+    static STDIN: Lazy<Mutex<BufReader<StdinMaybe>>> = Lazy::new();
+    fn stdin_init() -> Mutex<BufReader<StdinMaybe>> {
+        Mutex::new(BufReader::with_capacity(stdio::STDIN_BUF_SIZE, StdinMaybe::new(stdin_raw())))
     }
 
     Stdin {
@@ -222,7 +308,11 @@ impl Stdin {
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn lock(&self) -> StdinLock {
-        StdinLock { inner: self.inner.lock().unwrap_or_else(|e| e.into_inner()) }
+        let mut locked_stdin = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        // Determine whether stdin exists or should be faked. The Windows implementation of
+        // `StdinRaw` will take this upportunity to get a fresh handle.
+        locked_stdin.get_mut().check_exists();
+        StdinLock { inner: locked_stdin }
     }
 
     /// Locks this handle and reads a line of input into the specified buffer.
@@ -327,10 +417,7 @@ impl fmt::Debug for StdinLock<'_> {
 /// [`io::stdout`]: fn.stdout.html
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct Stdout {
-    // FIXME: this should be LineWriter or BufWriter depending on the state of
-    //        stdout (tty or not). Note that if this is not line buffered it
-    //        should also flush-on-panic or some form of flush-on-abort.
-    inner: &'static ReentrantMutex<RefCell<LineWriter<StdoutRaw>>>,
+    inner: &'static ReentrantMutex<RefCell<StdoutWriter>>,
 }
 
 /// A locked reference to the `Stdout` handle.
@@ -347,7 +434,7 @@ pub struct Stdout {
 /// [`Stdout::lock`]: struct.Stdout.html#method.lock
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct StdoutLock<'a> {
-    inner: ReentrantMutexGuard<'a, RefCell<LineWriter<StdoutRaw>>>,
+    inner: ReentrantMutexGuard<'a, RefCell<StdoutWriter>>,
 }
 
 /// Constructs a new handle to the standard output of the current process.
@@ -393,9 +480,9 @@ pub struct StdoutLock<'a> {
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
 pub fn stdout() -> Stdout {
-    static STDOUT: Lazy<ReentrantMutex<RefCell<LineWriter<StdoutRaw>>>> = Lazy::new();
-    fn stdout_init() -> ReentrantMutex<RefCell<LineWriter<StdoutRaw>>> {
-        ReentrantMutex::new(RefCell::new(LineWriter::new(stdout_raw())))
+    static STDOUT: Lazy<ReentrantMutex<RefCell<StdoutWriter>>> = Lazy::new();
+    fn stdout_init() -> ReentrantMutex<RefCell<StdoutWriter>> {
+        ReentrantMutex::new(RefCell::new(StdoutWriter::new()))
     }
 
     Stdout {
@@ -428,7 +515,11 @@ impl Stdout {
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn lock(&self) -> StdoutLock {
-        StdoutLock { inner: self.inner.lock().unwrap_or_else(|e| e.into_inner()) }
+        let locked_stdout = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        // Determine stdout mode. The Windows implementation of `StdoutRaw` will take this
+        // upportunity to get a fresh handle. FIXME
+        let _ = locked_stdout.borrow_mut().switch_buffering_mode();
+        StdoutLock { inner: locked_stdout }
     }
 }
 
@@ -471,6 +562,69 @@ impl fmt::Debug for StdoutLock<'_> {
     }
 }
 
+enum StdoutWriter {
+    LineMode(LineWriter<StdoutRaw>),
+    BlockMode(BufWriter<StdoutRaw>),
+}
+
+impl StdoutWriter {
+    fn new() -> StdoutWriter {
+        // Arbitrary choice to start with a LineWriter.
+        StdoutWriter::LineMode(LineWriter::new(stdout_raw()))
+    }
+
+    fn switch_buffering_mode(&mut self) {
+        let stdout_mode = match self {
+            StdoutWriter::LineMode(buf_writer) => buf_writer.get_mut().get_mode(),
+            StdoutWriter::BlockMode(buf_writer) => buf_writer.get_mut().get_mode(),
+        }.unwrap_or(StdioMode::None);
+
+        // Switch to the appropriate buffer strategy if necessary.
+        let switch = match stdout_mode {
+            StdioMode::Terminal |
+            StdioMode::PipedTerminal => {
+                match self {
+                    StdoutWriter::BlockMode(w) => {
+                        let sentinel = BufWriter::with_capacity(0, stdout_raw());
+                        let bufwriter = mem::replace(w, sentinel);
+                        Some(StdoutWriter::LineMode(LineWriter::from_bufwriter(bufwriter)))
+                    },
+                    _ => None,
+                }
+            },
+            StdioMode::Pipe => {
+                match self {
+                    StdoutWriter::LineMode(w) => {
+                        let sentinel = LineWriter::with_capacity(0, stdout_raw());
+                        let linewriter = mem::replace(w, sentinel);
+                        Some(StdoutWriter::BlockMode(LineWriter::into_bufwriter(linewriter)))
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        if let Some(mut new) = switch {
+            mem::swap(self, &mut new);
+        }
+    }
+}
+
+impl Write for StdoutWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            StdoutWriter::LineMode(buf_writer) => buf_writer.write(buf),
+            StdoutWriter::BlockMode(buf_writer) => buf_writer.write(buf),
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            StdoutWriter::LineMode(buf_writer) => buf_writer.flush(),
+            StdoutWriter::BlockMode(buf_writer) => buf_writer.flush(),
+        }
+    }
+}
+
 /// A handle to the standard error stream of a process.
 ///
 /// For more information, see the [`io::stderr`] method.
@@ -483,7 +637,7 @@ impl fmt::Debug for StdoutLock<'_> {
 /// an error.
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct Stderr {
-    inner: &'static ReentrantMutex<RefCell<StderrRaw>>,
+    inner: &'static ReentrantMutex<RefCell<StderrMaybe>>,
 }
 
 /// A locked reference to the `Stderr` handle.
@@ -499,7 +653,7 @@ pub struct Stderr {
 /// an error.
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct StderrLock<'a> {
-    inner: ReentrantMutexGuard<'a, RefCell<StderrRaw>>,
+    inner: ReentrantMutexGuard<'a, RefCell<StderrMaybe>>,
 }
 
 /// Constructs a new handle to the standard error of the current process.
@@ -541,9 +695,9 @@ pub struct StderrLock<'a> {
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
 pub fn stderr() -> Stderr {
-    static STDERR: Lazy<ReentrantMutex<RefCell<StderrRaw>>> = Lazy::new();
-    fn stderr_init() -> ReentrantMutex<RefCell<StderrRaw>> {
-        ReentrantMutex::new(RefCell::new(stderr_raw()))
+    static STDERR: Lazy<ReentrantMutex<RefCell<StderrMaybe>>> = Lazy::new();
+    fn stderr_init() -> ReentrantMutex<RefCell<StderrMaybe>> {
+        ReentrantMutex::new(RefCell::new(StderrMaybe::new(stderr_raw())))
     }
 
     Stderr {
@@ -576,7 +730,11 @@ impl Stderr {
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn lock(&self) -> StderrLock {
-        StderrLock { inner: self.inner.lock().unwrap_or_else(|e| e.into_inner()) }
+        let locked_stderr = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        // Determine whether stderr exists or should be faked. The Windows implementation of
+        // `StderrRaw` will take this upportunity to get a fresh handle.
+        locked_stderr.borrow_mut().check_exists();
+        StderrLock { inner: locked_stderr }
     }
 }
 

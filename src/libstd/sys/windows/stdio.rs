@@ -38,7 +38,7 @@ impl Stdin {
     pub fn new() -> Stdin {
         Stdin {
             surrogate: 0,
-            mode: StdioMode::Unknown,
+            mode: StdioMode::None,
             handle: ManuallyDrop::new(unsafe { File::from_raw_handle(ptr::null_mut()) }),
         }
     }
@@ -57,9 +57,12 @@ impl io::Read for Stdin {
             StdioMode::Terminal => (*self.handle).as_raw_handle(),
             StdioMode::Pipe |
             StdioMode::PipedTerminal => return (*self.handle).read(buf),
-            StdioMode::None => return Ok(buf.len()),
-            StdioMode::Unknown => {
+            StdioMode::None => {
+                // Do one more attempt get a handle. If the mode is still `None`, return an error.
                 self.get_mode()?;
+                if let StdioMode::None = self.mode {
+                    return Err(io::Error::from_raw_os_error(c::ERROR_INVALID_HANDLE as i32))
+                }
                 return self.read(buf)
             }
         };
@@ -91,7 +94,7 @@ pub struct Stdout {
 impl Stdout {
     pub fn new() -> Stdout {
         Stdout {
-            mode: StdioMode::Unknown,
+            mode: StdioMode::None,
             handle: ManuallyDrop::new(unsafe { File::from_raw_handle(ptr::null_mut()) }),
         }
     }
@@ -110,10 +113,14 @@ impl io::Write for Stdout {
             StdioMode::Terminal => write_console((*self.handle).as_raw_handle(), buf),
             StdioMode::Pipe |
             StdioMode::PipedTerminal => (*self.handle).write(buf),
-            StdioMode::None => Ok(buf.len()),
-            StdioMode::Unknown => {
+            StdioMode::None => {
+                // Do one more attempt get a handle. If the mode is still `None`, return an error.
                 self.get_mode()?;
-                self.write(buf)
+                if let StdioMode::None = self.mode {
+                    Err(io::Error::from_raw_os_error(c::ERROR_INVALID_HANDLE as i32))
+                } else {
+                    self.write(buf)
+                }
             }
         }
     }
@@ -131,7 +138,7 @@ pub struct Stderr {
 impl Stderr {
     pub fn new() -> Stderr {
         Stderr {
-            mode: StdioMode::Unknown,
+            mode: StdioMode::None,
             handle: ManuallyDrop::new(unsafe { File::from_raw_handle(ptr::null_mut()) }),
         }
     }
@@ -150,10 +157,14 @@ impl io::Write for Stderr {
             StdioMode::Terminal => write_console((*self.handle).as_raw_handle(), buf),
             StdioMode::Pipe |
             StdioMode::PipedTerminal => (*self.handle).write(buf),
-            StdioMode::None => Ok(buf.len()),
-            StdioMode::Unknown => {
+            StdioMode::None => {
+                // Do one more attempt get a handle. If the mode is still `None`, return an error.
                 self.get_mode()?;
-                self.write(buf)
+                if let StdioMode::None = self.mode {
+                    Err(io::Error::from_raw_os_error(c::ERROR_INVALID_HANDLE as i32))
+                } else {
+                    self.write(buf)
+                }
             }
         }
     }
