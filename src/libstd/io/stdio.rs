@@ -2,7 +2,7 @@ use crate::io::prelude::*;
 
 use crate::cell::RefCell;
 use crate::fmt;
-use crate::io::lazy::Lazy;
+use crate::io::lazy::{Lazy, InUseGuard};
 use crate::io::{self, Initializer, BufReader, LineWriter};
 use crate::sync::{Mutex, MutexGuard};
 use crate::sys::stdio;
@@ -82,6 +82,7 @@ impl Write for StderrRaw {
     fn flush(&mut self) -> io::Result<()> { self.0.flush() }
 }
 
+// FIXME: this name no longer really reflects what the type does.
 struct Maybe<T> (T);
 
 impl<W: io::Write> io::Write for Maybe<W> {
@@ -128,7 +129,7 @@ fn handle_ebadf<T>(r: io::Result<T>, default: T) -> io::Result<T> {
 /// an error.
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct Stdin {
-    inner: &'static Mutex<BufReader<Maybe<StdinRaw>>>,
+    inner: InUseGuard<Mutex<BufReader<Maybe<StdinRaw>>>>,
 }
 
 /// A locked reference to the `Stdin` handle.
@@ -339,7 +340,7 @@ pub struct Stdout {
     // FIXME: this should be LineWriter or BufWriter depending on the state of
     //        stdout (tty or not). Note that if this is not line buffered it
     //        should also flush-on-panic or some form of flush-on-abort.
-    inner: &'static ReentrantMutex<RefCell<LineWriter<Maybe<StdoutRaw>>>>,
+    inner: InUseGuard<ReentrantMutex<RefCell<LineWriter<Maybe<StdoutRaw>>>>>,
 }
 
 /// A locked reference to the `Stdout` handle.
@@ -492,7 +493,7 @@ impl fmt::Debug for StdoutLock<'_> {
 /// an error.
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct Stderr {
-    inner: &'static ReentrantMutex<RefCell<Maybe<StderrRaw>>>,
+    inner: InUseGuard<ReentrantMutex<RefCell<Maybe<StderrRaw>>>>,
 }
 
 /// A locked reference to the `Stderr` handle.
